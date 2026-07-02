@@ -9,25 +9,29 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 class CameraStream:
-    def __init__(self, camera_id):
+    def __init__(self, camera_id, lane_index):
         self.camera_id = camera_id
+        self.lane_index = lane_index
         self.cam = IMAQdx.IMAQdxCamera(camera_id)
         
-        # Pull the raw row-by-row Bayer data matrix to Python
+        # FIX: Re-enable raw row readout to bypass pylablib's format block
         self.cam.enable_raw_readout('rows') 
         
         self.frame = None
         self.running = False
         self.thread = None
-        self.pixel_format = "mono"
+        
+        # Thread-safe image caches passed directly to the GUI
+        self.current_rgb_frame = None
+        self.current_display_frame = None
+        self.width = 0
+        self.height = 0
+        
+        # Independent performance timestamps
+        self.prev_time = time.time()
+        self.fps = 0.0
 
     def start(self):
-        try:
-            self.pixel_format = str(self.cam.get_attribute_value("PixelFormat")).lower()
-            print(f"[INFO] Camera {self.camera_id} initialized with format: {self.pixel_format}")
-        except Exception:
-            self.pixel_format = "bayer_rg"  
-            
         self.cam.start_acquisition()
         self.running = True
         self.thread = threading.Thread(target=self._update, args=(), daemon=True)
@@ -35,19 +39,55 @@ class CameraStream:
         return self
 
     def _update(self):
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.7
+        thickness = 2
+
         while self.running:
             try:
                 new_frame = self.cam.read_newest_image()
                 if new_frame is not None:
+                    # Capture the 2D matrix dimensions from the raw readout
+                    h, w = new_frame.shape[:2]
+                    self.width = w
+                    self.height = h
+
+                    # BACKGROUND COMPUTATION: Demosaicing the raw Bayer grid
+                    # We use BayerBG2BGR here because it fixed your Red/Blue swap earlier
+                    try:
+                        color_frame = cv2.cvtColor(new_frame, cv2.COLOR_BayerBG2BGR)
+                    except Exception:
+                        color_frame = cv2.cvtColor(new_frame, cv2.COLOR_GRAY2BGR)
+
+                    # Store full resolution pristine frame safely for disk writing
+                    self.current_rgb_frame = color_frame
+
+                    # BACKGROUND COMPUTATION: Downscale Preview Image Layout
+                    display_frame = cv2.resize(color_frame, (768, 480))
+
+                    # BACKGROUND COMPUTATION: Calculate Hardware FPS Rate
+                    current_time = time.time()
+                    time_diff = current_time - self.prev_time
+                    if time_diff > 0:
+                        self.fps = 1.0 / time_diff
+                    self.prev_time = current_time
+
+                    # BACKGROUND COMPUTATION: Render Text Overlay Matrix
+                    fps_text = f"FPS: {self.fps:.1f}"
+                    text_size = cv2.getTextSize(fps_text, font, font_scale, thickness)[0]
+                    text_x = display_frame.shape[1] - text_size[0] - 20
+                    text_y = text_size[1] + 20
+                    
+                    cv2.putText(display_frame, fps_text, (text_x, text_y), font, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
+
+                    # Expose the completely processed frame to the GUI loop
+                    self.current_display_frame = display_frame
                     self.frame = new_frame
                 else:
-                    time.sleep(0.01)
+                    time.sleep(0.002)
             except Exception as e:
-                print(f"\n[THREAD ERROR] Camera {self.camera_id} connection dropped: {e}")
+                print(f"\n[THREAD ERROR] Camera {self.camera_id} loop crash: {e}")
                 self.running = False
-
-    def read(self):
-        return self.frame
 
     def stop(self):
         self.running = False
@@ -73,10 +113,6 @@ class MultiCameraControlPanel:
         self.res_detected = [False] * self.NUM_CHANNELS
         self.combos = []
         self.res_entries = []
-        
-        # --- NEW: Independent FPS Performance Trackers ---
-        self.prev_times = [time.time()] * self.NUM_CHANNELS
-        self.fps_rates = [0.0] * self.NUM_CHANNELS
         
         self.is_streaming = False
         self.is_auto_saving = False
@@ -170,10 +206,8 @@ class MultiCameraControlPanel:
                 
                 for idx, cam_id in active_selections.items():
                     os.makedirs(os.path.join(self.base_folder, f"camera {idx+1}"), exist_ok=True)
-                    self.streams[idx] = CameraStream(cam_id).start()
+                    self.streams[idx] = CameraStream(cam_id, idx).start()
                     self.res_detected[idx] = False
-                    # Reset timestamps upon activation to avoid spikes
-                    self.prev_times[idx] = time.time()
                 
                 self.is_streaming = True
                 self.btn_toggle_feed.config(text="Stop Live Feed")
@@ -183,7 +217,7 @@ class MultiCameraControlPanel:
                 for combo in self.combos: combo.config(state="disabled")
                 self.status_lbl.config(text=f"Active Streaming Channels: {len(active_selections)}", foreground="green")
                 
-                self.update_loop()
+                self.update_feed_loop()
                 
             except Exception as e:
                 self.stop_hardware()
@@ -247,73 +281,28 @@ class MultiCameraControlPanel:
         self.capture_frames(mode="AUTO")
         self.auto_save_job = self.window.after(self.auto_save_interval, self.auto_save_loop)
 
-    def update_loop(self):
+    def update_feed_loop(self):
         if not self.is_streaming:
             return
 
         for i in range(self.NUM_CHANNELS):
             if self.streams[i] is not None:
-                raw_frame = self.streams[i].read()
+                display_frame = self.streams[i].current_display_frame
                 
-                if raw_frame is None:
+                if display_frame is None:
                     continue
                 
-                h, w = raw_frame.shape[:2]
-
                 if not self.res_detected[i]:
+                    w = self.streams[i].width
+                    h = self.streams[i].height
                     self.set_entry_text(self.res_entries[i], f"{w} x {h}")
                     self.res_detected[i] = True
-
-                fmt = self.streams[i].pixel_format
-                try:
-                    if "bayer" in fmt:
-                        if "rg" in fmt:
-                            color_frame = cv2.cvtColor(raw_frame, cv2.COLOR_BayerBG2BGR)
-                        elif "bg" in fmt:
-                            color_frame = cv2.cvtColor(raw_frame, cv2.COLOR_BayerRG2BGR)
-                        elif "gr" in fmt:
-                            color_frame = cv2.cvtColor(raw_frame, cv2.COLOR_BayerGB2BGR)
-                        else:
-                            color_frame = cv2.cvtColor(raw_frame, cv2.COLOR_BayerGR2BGR)
-                    else:
-                        color_frame = cv2.cvtColor(raw_frame, cv2.COLOR_GRAY2BGR)
-                except Exception:
-                    try:
-                        color_frame = cv2.cvtColor(raw_frame, cv2.COLOR_BayerBG2BGR)
-                    except cv2.error:
-                        color_frame = cv2.cvtColor(raw_frame, cv2.COLOR_GRAY2BGR)
-
-                self.streams[i].current_rgb_frame = color_frame
-
-                display_frame = cv2.resize(color_frame, (768, 480))
-
-                # --- Dynamic Frame Rate Calculator per Lane ---
-                current_time = time.time()
-                time_diff = current_time - self.prev_times[i]
-                if time_diff > 0:
-                    self.fps_rates[i] = 1.0 / time_diff
-                self.prev_times[i] = current_time
-
-                # --- Top-Right Alignment Text Engine ---
-                fps_text = f"FPS: {self.fps_rates[i]:.1f}"
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.7
-                thickness = 2
-                
-                # Get width and height of the text string box to dynamically calculate right offset
-                text_size = cv2.getTextSize(fps_text, font, font_scale, thickness)[0]
-                
-                # Formula: WindowWidth - TextWidth - RightPadding
-                text_x = display_frame.shape[1] - text_size[0] - 20
-                text_y = text_size[1] + 20 # 20px down from the top edge
-                
-                # Render bright green text overlay onto the display matrix
-                cv2.putText(display_frame, fps_text, (text_x, text_y), font, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
 
                 cv2.imshow(f"Live Feed - Camera {i+1} ({self.combos[i].get()})", display_frame)
 
         cv2.waitKey(1)
-        self.window.after(20, self.update_loop)
+        # 5ms polling loop catches frames as fast as the background thread finishes them
+        self.window.after(5, self.update_feed_loop)
 
     def capture_frames(self, mode="MANUAL"):
         if not self.is_streaming:
@@ -321,7 +310,7 @@ class MultiCameraControlPanel:
 
         saved_any = False
         for i in range(self.NUM_CHANNELS):
-            if self.streams[i] is not None and hasattr(self.streams[i], 'current_rgb_frame'):
+            if self.streams[i] is not None and self.streams[i].current_rgb_frame is not None:
                 target_dir = os.path.join(self.base_folder, f"camera {i+1}")
                 filename = os.path.join(target_dir, f"{self.frame_counter:04d}.jpg")
                 
