@@ -14,7 +14,7 @@ class CameraStream:
         self.lane_index = lane_index
         self.cam = IMAQdx.IMAQdxCamera(camera_id)
         
-        # FIX: Re-enable raw row readout to bypass pylablib's format block
+        # Pull the raw row-by-row Bayer data matrix to Python
         self.cam.enable_raw_readout('rows') 
         
         self.frame = None
@@ -53,7 +53,6 @@ class CameraStream:
                     self.height = h
 
                     # BACKGROUND COMPUTATION: Demosaicing the raw Bayer grid
-                    # We use BayerBG2BGR here because it fixed your Red/Blue swap earlier
                     try:
                         color_frame = cv2.cvtColor(new_frame, cv2.COLOR_BayerBG2BGR)
                     except Exception:
@@ -166,10 +165,11 @@ class MultiCameraControlPanel:
         self.entry_interval.insert(0, "1000")
         self.entry_interval.grid(row=1, column=5, padx=5, pady=3, sticky="w")
         
-        self.btn_toggle_auto = ttk.Button(main_frame, text="Start Auto Save", command=self.toggle_auto_save, state="disabled", width=16)
+        # CHANGED: Enabled by default so captures can be initiated without open display frames
+        self.btn_toggle_auto = ttk.Button(main_frame, text="Start Auto Save", command=self.toggle_auto_save, width=16)
         self.btn_toggle_auto.grid(row=2, column=4, columnspan=2, padx=25, pady=3, sticky="ew")
         
-        self.btn_capture = ttk.Button(main_frame, text="Capture Frame (C)", command=lambda: self.capture_frames("MANUAL"), state="disabled", width=16)
+        self.btn_capture = ttk.Button(main_frame, text="Capture Frame (C)", command=lambda: self.capture_frames("MANUAL"), width=16)
         self.btn_capture.grid(row=3, column=4, columnspan=2, padx=25, pady=3, sticky="ew")
 
         self.status_lbl = ttk.Label(main_frame, text="Disconnected", foreground="red", font=("Helvetica", 10, "bold"))
@@ -184,68 +184,80 @@ class MultiCameraControlPanel:
         entry_widget.insert(0, text)
         entry_widget.config(state="readonly")
 
-    def toggle_feed(self):
-        if not self.is_streaming:
-            active_selections = {}
+    def ensure_hardware_started(self):
+        """Helper to safely initialize active threads if they aren't already running."""
+        if any(x is not None for x in self.streams):
+            return True  # Already initialized by another module
+            
+        active_selections = {}
+        for i in range(self.NUM_CHANNELS):
+            selection = self.combos[i].get()
+            if selection != "None":
+                if selection in active_selections.values():
+                    messagebox.showerror("Conflict Error", f"Camera ID '{selection}' is selected multiple times.")
+                    return False
+                active_selections[i] = selection
+        
+        if not active_selections:
+            messagebox.showwarning("Selection Missing", "Please configure at least one active Camera ID.")
+            return False
+            
+        try:
+            self.status_lbl.config(text="Booting up active channels...", foreground="orange")
+            self.window.update()
+            
+            for idx, cam_id in active_selections.items():
+                os.makedirs(os.path.join(self.base_folder, f"camera {idx+1}"), exist_ok=True)
+                self.streams[idx] = CameraStream(cam_id, idx).start()
+                self.res_detected[idx] = False
+            
+            for combo in self.combos: combo.config(state="disabled")
+            return True
+        except Exception as e:
+            self.check_hardware_shutdown()
+            messagebox.showerror("Hardware Error", f"Initialization failed:\n{e}")
+            return False
+
+    def check_hardware_shutdown(self):
+        """Safely stops threads and drops UI barriers only when BOTH systems are offline."""
+        if not self.is_streaming and not self.is_auto_saving:
+            for idx, combo in enumerate(self.combos):
+                combo.config(state="readonly")
+                self.set_entry_text(self.res_entries[idx], "None")
+                
+            self.status_lbl.config(text="Disconnected", foreground="red")
             
             for i in range(self.NUM_CHANNELS):
-                selection = self.combos[i].get()
-                if selection != "None":
-                    if selection in active_selections.values():
-                        messagebox.showerror("Conflict Error", f"Camera ID '{selection}' is selected multiple times.")
-                        return
-                    active_selections[i] = selection
+                if self.streams[i] is not None:
+                    self.streams[i].stop()
+                    self.streams[i] = None
             
-            if not active_selections:
-                messagebox.showwarning("Selection Missing", "Please configure at least one active Camera ID.")
-                return
-                
-            try:
-                self.status_lbl.config(text="Booting up active channels...", foreground="orange")
-                self.window.update()
-                
-                for idx, cam_id in active_selections.items():
-                    os.makedirs(os.path.join(self.base_folder, f"camera {idx+1}"), exist_ok=True)
-                    self.streams[idx] = CameraStream(cam_id, idx).start()
-                    self.res_detected[idx] = False
-                
+            cv2.destroyAllWindows()
+        else:
+            self.update_status_display()
+
+    def update_status_display(self):
+        """Updates the status label messaging based on running modules."""
+        active_count = sum(1 for x in self.streams if x is not None)
+        if self.is_streaming and self.is_auto_saving:
+            self.status_lbl.config(text=f"Streaming & Auto-Saving Active ({active_count} Cams) | Every {self.auto_save_interval}ms", foreground="purple")
+        elif self.is_streaming:
+            self.status_lbl.config(text=f"Live Feed Streaming Active ({active_count} Cams)", foreground="green")
+        elif self.is_auto_saving:
+            self.status_lbl.config(text=f"Background Auto-Save Active ({active_count} Cams) | Every {self.auto_save_interval}ms", foreground="blue")
+
+    def toggle_feed(self):
+        if not self.is_streaming:
+            if self.ensure_hardware_started():
                 self.is_streaming = True
                 self.btn_toggle_feed.config(text="Stop Live Feed")
-                self.btn_capture.config(state="normal")
-                self.btn_toggle_auto.config(state="normal")
-                
-                for combo in self.combos: combo.config(state="disabled")
-                self.status_lbl.config(text=f"Active Streaming Channels: {len(active_selections)}", foreground="green")
-                
+                self.update_status_display()
                 self.update_feed_loop()
-                
-            except Exception as e:
-                self.stop_hardware()
-                messagebox.showerror("Hardware Error", f"Initialization failed:\n{e}")
         else:
-            self.stop_hardware()
-
-    def stop_hardware(self):
-        if self.is_auto_saving:
-            self.stop_auto_save()
-
-        self.is_streaming = False
-        self.btn_toggle_feed.config(text="Start Live Feed")
-        self.btn_capture.config(state="disabled")
-        self.btn_toggle_auto.config(state="disabled")
-        
-        for idx, combo in enumerate(self.combos):
-            combo.config(state="readonly")
-            self.set_entry_text(self.res_entries[idx], "None")
-            
-        self.status_lbl.config(text="Disconnected", foreground="red")
-        
-        for i in range(self.NUM_CHANNELS):
-            if self.streams[i] is not None:
-                self.streams[i].stop()
-                self.streams[i] = None
-        
-        cv2.destroyAllWindows()
+            self.is_streaming = False
+            self.btn_toggle_feed.config(text="Start Live Feed")
+            cv2.destroyAllWindows()
+            self.check_hardware_shutdown()
 
     def toggle_auto_save(self):
         if not self.is_auto_saving:
@@ -256,12 +268,13 @@ class MultiCameraControlPanel:
                 messagebox.showerror("Invalid Input", "Enter a positive integer interval (Minimum: 50ms).")
                 return
 
-            self.auto_save_interval = interval
-            self.is_auto_saving = True
-            self.btn_toggle_auto.config(text="Stop Auto Save")
-            self.entry_interval.config(state="disabled")
-            self.status_lbl.config(text=f"Auto Recording Active (Every {self.auto_save_interval}ms)", foreground="blue")
-            self.auto_save_loop()
+            if self.ensure_hardware_started():
+                self.auto_save_interval = interval
+                self.is_auto_saving = True
+                self.btn_toggle_auto.config(text="Stop Auto Save")
+                self.entry_interval.config(state="disabled")
+                self.update_status_display()
+                self.auto_save_loop()
         else:
             self.stop_auto_save()
 
@@ -272,11 +285,10 @@ class MultiCameraControlPanel:
         if self.auto_save_job:
             self.window.after_cancel(self.auto_save_job)
             self.auto_save_job = None
-        if self.is_streaming:
-            self.status_lbl.config(text="Streaming Active (Auto Save Stopped)", foreground="green")
+        self.check_hardware_shutdown()
 
     def auto_save_loop(self):
-        if not self.is_auto_saving or not self.is_streaming:
+        if not self.is_auto_saving:
             return
         self.capture_frames(mode="AUTO")
         self.auto_save_job = self.window.after(self.auto_save_interval, self.auto_save_loop)
@@ -295,22 +307,27 @@ class MultiCameraControlPanel:
                 if not self.res_detected[i]:
                     w = self.streams[i].width
                     h = self.streams[i].height
-                    self.set_entry_text(self.res_entries[i], f"{w} x {h}")
-                    self.res_detected[i] = True
+                    if w > 0 and h > 0:
+                        self.set_entry_text(self.res_entries[i], f"{w} x {h}")
+                        self.res_detected[i] = True
 
                 cv2.imshow(f"Live Feed - Camera {i+1} ({self.combos[i].get()})", display_frame)
 
         cv2.waitKey(1)
-        # 5ms polling loop catches frames as fast as the background thread finishes them
         self.window.after(5, self.update_feed_loop)
 
     def capture_frames(self, mode="MANUAL"):
-        if not self.is_streaming:
-            return
-
         saved_any = False
         for i in range(self.NUM_CHANNELS):
             if self.streams[i] is not None and self.streams[i].current_rgb_frame is not None:
+                # Update resolution tracking UI metrics even if live display canvases are sleeping
+                if not self.res_detected[i]:
+                    w = self.streams[i].width
+                    h = self.streams[i].height
+                    if w > 0 and h > 0:
+                        self.set_entry_text(self.res_entries[i], f"{w} x {h}")
+                        self.res_detected[i] = True
+
                 target_dir = os.path.join(self.base_folder, f"camera {i+1}")
                 filename = os.path.join(target_dir, f"{self.frame_counter:04d}.jpg")
                 
@@ -323,8 +340,14 @@ class MultiCameraControlPanel:
             self.frame_counter += 1
 
     def on_closing(self):
-        if self.is_streaming:
-            self.stop_hardware()
+        self.is_streaming = False
+        self.is_auto_saving = False
+        if self.auto_save_job:
+            self.window.after_cancel(self.auto_save_job)
+        for i in range(self.NUM_CHANNELS):
+            if self.streams[i] is not None:
+                self.streams[i].stop()
+        cv2.destroyAllWindows()
         self.window.destroy()
 
 
